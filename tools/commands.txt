@@ -1,0 +1,27 @@
+# Synapse
+CUDA_VISIBLE_DEVICES=0 python train.py --dataset Synapse --img-size 224 --epochs 250 \
+  --batch-size 24 --learning-rate 1e-5 \
+  --checkpoint-dir outputs/unet/synapse --amp
+
+CUDA_VISIBLE_DEVICES=0 python test.py --dataset Synapse \
+  --checkpoint outputs/unet/synapse/best_model.pth \
+  --img-size 224 --benchmark-dir benchmark
+
+# ACDC
+CUDA_VISIBLE_DEVICES=1 python train.py --dataset ACDC --img-size 224 --epochs 250 \
+  --batch-size 24 --learning-rate 1e-5 \
+  --checkpoint-dir outputs/unet/acdc --amp
+
+CUDA_VISIBLE_DEVICES=0 python test.py --dataset ACDC \
+  --checkpoint outputs/unet/acdc/ACDC_epoch9_score0.366345.pth \
+  --img-size 224 --acdc-zspacing 5.0 --benchmark-dir benchmark
+
+# Cataract1k
+CUDA_VISIBLE_DEVICES=2 python train.py --dataset Cataract1k --img-size 224 --epochs 250 \
+  --batch-size 24 --learning-rate 1e-5 \
+  --checkpoint-dir outputs/unet/cataract1k --amp
+
+CUDA_VISIBLE_DEVICES=1 python test.py --dataset Cataract1k \
+  --checkpoint outputs/unet/cataract1k/best_model.pth \
+  --img-size 224 --normalize-present-class-eval \
+  --benchmark-dir benchmark

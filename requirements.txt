@@ -1,5 +1,23 @@
-matplotlib==3.6.2
-numpy==1.23.5
-Pillow==9.3.0
-tqdm==4.64.1
-wandb==0.13.5
+# Install a PyTorch build appropriate for the local CUDA/CPU environment.
+torch>=1.13
+torchvision>=0.14
+
+numpy>=1.23
+scipy>=1.9
+h5py>=3.7
+opencv-python>=4.6
+pandas>=1.5
+medpy>=0.4
+SimpleITK>=2.2
+nibabel>=4.0
+fvcore
+thop
+tqdm>=4.64
+Pillow>=9.3
+matplotlib>=3.6
+
+# Optional at runtime; training imports it only when --wandb is supplied.
+wandb>=0.13
+
+# Lightweight verification suite.
+pytest>=7

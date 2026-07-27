@@ -1,189 +1,205 @@
-# U-Net: Semantic segmentation with PyTorch
-<a href="#"><img src="https://img.shields.io/github/actions/workflow/status/milesial/PyTorch-UNet/main.yml?logo=github&style=for-the-badge" /></a>
-<a href="https://hub.docker.com/r/milesial/unet"><img src="https://img.shields.io/badge/docker%20image-available-blue?logo=Docker&style=for-the-badge" /></a>
-<a href="https://pytorch.org/"><img src="https://img.shields.io/badge/PyTorch-v1.13+-red.svg?logo=PyTorch&style=for-the-badge" /></a>
-<a href="#"><img src="https://img.shields.io/badge/python-v3.6+-blue.svg?logo=python&style=for-the-badge" /></a>
+# Pytorch-UNet
 
-![input and output for a random image in the test dataset](https://i.imgur.com/GD8FcB7.png)
+This repository keeps the original plain U-Net architecture and adds reproducible training, volume/frame accuracy evaluation, and real-sample benchmarking for Synapse, ACDC, and Cataract1k. The original Carvana loader and `predict.py` workflow remain available.
 
+## Installation
 
-Customized implementation of the [U-Net](https://arxiv.org/abs/1505.04597) in PyTorch for Kaggle's [Carvana Image Masking Challenge](https://www.kaggle.com/c/carvana-image-masking-challenge) from high definition images.
+Install a PyTorch build appropriate for the machine, then install the remaining dependencies:
 
-- [Quick start](#quick-start)
-  - [Without Docker](#without-docker)
-  - [With Docker](#with-docker)
-- [Description](#description)
-- [Usage](#usage)
-  - [Docker](#docker)
-  - [Training](#training)
-  - [Prediction](#prediction)
-- [Weights & Biases](#weights--biases)
-- [Pretrained model](#pretrained-model)
-- [Data](#data)
-
-## Quick start
-
-### Without Docker
-
-1. [Install CUDA](https://developer.nvidia.com/cuda-downloads)
-
-2. [Install PyTorch 1.13 or later](https://pytorch.org/get-started/locally/)
-
-3. Install dependencies
 ```bash
 pip install -r requirements.txt
 ```
 
-4. Download the data and run training:
+The medical workflows use SciPy/HDF5/OpenCV/Pandas for data, MedPy for Dice/Jaccard/HD95, SimpleITK for optional volume output, nibabel as an optional ACDC spacing source, and the benchmark utilities listed in `requirements.txt`. Weights & Biases is opt-in: training never imports or contacts it unless `--wandb` is supplied.
+
+## Dataset contracts
+
+The central registry in `utils/dataset_registry.py` is shared by training and testing. CLI path values override these defaults.
+
+| Dataset | Default training root | Default validation/test root | Input | Classes | Validation/test protocol |
+| --- | --- | --- | --- | --- | --- |
+| Synapse | `/data/halyusuf/data/Synapse/train_npz/` | `/data/halyusuf/data/Synapse/test_vol_h5` | 1-channel grayscale | 9 | reconstructed 3-D volumes |
+| ACDC | `/data/halyusuf/data/ACDC` | same | 1-channel grayscale | 4 | reconstructed 3-D volumes with physical spacing |
+| Cataract1k | `/data/halyusuf/data/CataractData/` | same | 3-channel RGB | 5 | GT-present foreground classes per frame |
+
+`Catrakt1k` is accepted as a legacy CLI alias and is immediately canonicalized to `Cataract1k` in logs, checkpoints, output paths, protocol names, and JSON.
+
+Class order is fixed:
+
+- Synapse: Background, Aorta, Gallbladder, Kidney(L), Kidney(R), Liver, Pancreas, Spleen, Stomach.
+- ACDC: Background, Right Ventricle, Myocardium, Left Ventricle.
+- Cataract1k: Background, Pupil, Cornea, Lens, Instruments. `Pupil`/`pupil1`, `Cornea`/`cornea1`, `Lens`, `Instruments`, and the supplied surgical-instrument titles are mapped by `datasets/dataset_cataract.py`.
+
+### Expected layouts
+
+```text
+/data/halyusuf/data/Synapse/
+├── train_npz/
+│   └── case####_slice###.npz
+└── test_vol_h5/
+    └── case####.npy.h5
+
+./lists/lists_Synapse/
+├── train.txt
+└── test_vol.txt
+```
+
+The Synapse split lists are included in this repository. A custom `--list-dir` must contain both expected files.
+
+```text
+/data/halyusuf/data/ACDC/
+├── ACDC_training_slices/
+│   └── patient###_*.h5
+└── ACDC_training_volumes/
+    └── patient###_*.h5
+```
+
+The supplied active ACDC split is intentionally preserved: patients `021..100` train, while patients `001..020` are used for both validation and testing. This is not five-fold cross-validation. `--fold-id` remains compatibility-only and does not change the split.
+
+```text
+/data/halyusuf/data/CataractData/
+├── train.csv                 # column: imgs
+├── test.csv                  # column: imgs
+├── img/
+│   └── frame.png
+└── ann/
+    └── frame.png.json
+```
+
+Training and validation resize to the fixed `--img-size` (default 224). Cataract1k uses ImageNet mean/std normalization during both. Accuracy testing intentionally loads raw HWC RGB frames; the inference helper performs cubic RGB resize, optional ImageNet normalization, model inference, and nearest-neighbor resizing of the integer prediction to the original mask size.
+
+## Training
+
+Medical training uses the datasets' explicit splits—never `random_split`. The unchanged U-Net is constructed from the registry with 1 input channel for Synapse/ACDC and true 3-channel RGB for Cataract1k. The objective remains:
+
+```text
+ce_weight * cross_entropy + dice_weight * dice_loss
+```
+
+Both weights default to `1.0`. RMSprop, `ReduceLROnPlateau(mode="max")`, AMP, gradient clipping, and the original transposed-convolution default are retained. Python, NumPy, PyTorch, CUDA, and DataLoader workers are seeded; deterministic behavior defaults on and can be disabled with `--no-deterministic`.
+
+Training starts from random initialization because no U-Net pretrained checkpoint was supplied. To initialize from user-provided compatible weights, use `--init-checkpoint PATH` (also `--pretrained-checkpoint`). Use `--resume PATH` only for strict continuation; it requires and restores the epoch, optimizer, scheduler, AMP scaler, Python/NumPy/PyTorch/CUDA RNG, and DataLoader-generator states. A weights-only or incomplete checkpoint must be supplied through `--init-checkpoint` instead. The two modes cannot be combined. Explicitly supplied missing paths fail immediately.
+
+Each output directory contains:
+
+- `best_model.pth`, selected by the dataset's foreground validation mean Dice protocol;
+- `last_model.pth`, including the full continuation state;
+- `checkpoint_epoch_N.pth` when `--save-every N` is configured.
+
+Structured checkpoints record dataset, channels, classes, U-Net upsampling mode, image size, class names, normalization, arguments, epoch, and best Dice. Loading also supports raw state dictionaries, legacy `mask_values`, and `module.` prefixes. Strict test/resume loading rejects metadata or tensor incompatibility. `--allow-partial-init` is initialization-only and reports every loaded, missing, unexpected, and shape-incompatible key.
+
+Weights & Biases is disabled by default. Add `--wandb` only when desired.
+
+### Synapse
+
 ```bash
-bash scripts/download_data.sh
-python train.py --amp
+python train.py \
+  --dataset Synapse \
+  --img-size 224 \
+  --epochs 150 \
+  --batch-size 24 \
+  --learning-rate 1e-5 \
+  --checkpoint-dir outputs/unet/synapse \
+  --amp
+
+python test.py \
+  --dataset Synapse \
+  --checkpoint outputs/unet/synapse/best_model.pth \
+  --img-size 224 \
+  --benchmark-dir benchmark
 ```
 
-### With Docker
+### ACDC
 
-1. [Install Docker 19.03 or later:](https://docs.docker.com/get-docker/)
 ```bash
-curl https://get.docker.com | sh && sudo systemctl --now enable docker
+python train.py \
+  --dataset ACDC \
+  --img-size 224 \
+  --epochs 150 \
+  --batch-size 24 \
+  --learning-rate 1e-5 \
+  --checkpoint-dir outputs/unet/acdc \
+  --amp
+
+python test.py \
+  --dataset ACDC \
+  --checkpoint outputs/unet/acdc/best_model.pth \
+  --img-size 224 \
+  --acdc-zspacing 5.0 \
+  --benchmark-dir benchmark
 ```
-2. [Install the NVIDIA container toolkit:](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)
+
+### Cataract1k
+
 ```bash
-distribution=$(. /etc/os-release;echo $ID$VERSION_ID) \
-   && curl -s -L https://nvidia.github.io/nvidia-docker/gpgkey | sudo apt-key add - \
-   && curl -s -L https://nvidia.github.io/nvidia-docker/$distribution/nvidia-docker.list | sudo tee /etc/apt/sources.list.d/nvidia-docker.list
-sudo apt-get update
-sudo apt-get install -y nvidia-docker2
-sudo systemctl restart docker
+python train.py \
+  --dataset Cataract1k \
+  --img-size 224 \
+  --epochs 150 \
+  --batch-size 24 \
+  --learning-rate 1e-5 \
+  --checkpoint-dir outputs/unet/cataract1k \
+  --amp
+
+python test.py \
+  --dataset Cataract1k \
+  --checkpoint outputs/unet/cataract1k/best_model.pth \
+  --img-size 224 \
+  --normalize-present-class-eval \
+  --benchmark-dir benchmark
 ```
-3. [Download and run the image:](https://hub.docker.com/repository/docker/milesial/unet)
+
+Override defaults with `--root-path`, `--volume-path`, and `--list-dir`. No fictional pretrained path is used in these commands.
+
+## Accuracy protocols
+
+All reported accuracy excludes background. Per-class masks use MedPy `dc`, `jc`, and `hd95` exactly. When prediction and ground truth are both present, those values are returned directly. When exactly one is empty, Dice and IoU are zero and HD95 is the maximum physical diagonal `norm((shape - 1) * voxelspacing)`. When both are empty, Synapse/ACDC receive Dice/IoU 1 with undefined (`NaN`) HD95; the no-absent-reward diagnostic returns all `NaN`. Undefined HD95 is never changed to zero.
+
+Synapse and ACDC are reconstructed at original in-plane resolution one slice at a time. Image slices use cubic interpolation into the fixed model input; integer predictions use nearest-neighbor interpolation back. Metrics form `[case, foreground class, metric]`, are nan-averaged over cases first, then over classes. Synapse uses unit/unspecified metric spacing. ACDC first consumes dataset spacing metadata, normalizes it to positive `zyx`, and logs its source per case. If absent, `--acdc-zspacing` constructs `(z, 1, 1)`.
+
+Cataract1k uses the official `Cataract1k_frame_present_background_excluded` headline: determine the foreground classes present in each GT frame, average only those classes within the frame, then nan-average the evaluated frame means. A completely missed present class gets zero overlap and the 2-D diagonal HD95 penalty. GT-absent classes cannot improve the headline; predicted absent classes are counted separately. Background-only frames are discounted. Per-class and case-prefix-grouped values are diagnostics, not the headline aggregation.
+
+Optional `--save-predictions [PATH]` writes Synapse/ACDC image, label, and prediction volumes through SimpleITK, or Cataract1k PNG prediction masks. Saving is off by default and does not change metric inputs or benchmark timing.
+
+## System benchmark and JSON
+
+Accuracy inference runs first. The same real test split then supplies fixed-size benchmark tensors: a deterministic center slice for Synapse/ACDC volumes and true RGB frames for Cataract1k. Channel count must equal `model.n_channels`; grayscale is never expanded to RGB. Loading, resizing, and CPU normalization occur before the timed forward pass.
+
+Defaults are batch size 36, 20 warmups, 50 measured batches, 50 single-image warmups, 1,000 single-image latency samples, cuDNN fixed-input benchmarking enabled, benchmark AMP off, and one repeated run (valid range 1–10). Results include throughput, mean and p50/p90/p95/p99 latency, exact and million-scale parameter counts, model size, CUDA runtime allocator memory when available, input shape/channels, and repeated-run arrays/means/population standard deviations. CPU runtime memory is explicitly marked unavailable rather than reported as zero.
+
+The fallback U-Net FLOP counter includes `Conv2d`, `ConvTranspose2d`, and any `Linear` layers; pooling, normalization, activation, concatenation, padding, and interpolation are omitted. The convention is applied once: `FLOPs = 2 * MACs`.
+
+Accuracy and system statistics are printed and saved as one `BenchmarkResults` object under:
+
+```text
+benchmark/<canonical_dataset>/<checkpoint_stem>_<img_size>_<YYYYMMDD_HHMMSS>.json
+```
+
+The JSON has exactly `metrics` and `notes` at the top level. NumPy/PyTorch/path/dataclass values are converted recursively, and non-finite values become JSON `null` while remaining `NaN` during in-memory aggregation.
+
+`--verbose` or `--max-test-cases N` enters clearly logged partial smoke-test mode and skips the system benchmark. `--skip-system-benchmark` is also available for accuracy-only diagnostics; these runs are not official combined benchmarks.
+
+## Legacy Carvana prediction
+
+Carvana training remains available with `python train.py --dataset Carvana`; its image/mask defaults remain `data/imgs` and `data/masks`. Existing single-image prediction behavior is unchanged:
+
 ```bash
-sudo docker run --rm --shm-size=8g --ulimit memlock=-1 --gpus all -it milesial/unet
+python predict.py --input image.jpg --output mask.png
 ```
 
-4. Download the data and run training:
+The original Carvana release checkpoint is not downloaded or reused by the medical commands.
+
+## Verification
+
+Focused tests cover model channel/output shapes, robust logits extraction, metric edge cases and aggregation order, Cataract1k present-class behavior, ACDC spacing, benchmark collation/parameters/FLOPs/JSON, checkpoint compatibility, and registry defaults/aliases. Run:
+
 ```bash
-bash scripts/download_data.sh
-python train.py --amp
+python -m compileall train.py test.py unet datasets utils tests
+python train.py --help
+python test.py --help
+pytest -q
 ```
 
-## Description
-This model was trained from scratch with 5k images and scored a [Dice coefficient](https://en.wikipedia.org/wiki/S%C3%B8rensen%E2%80%93Dice_coefficient) of 0.988423 on over 100k test images.
+The focused checks for this revision were run with Python 3.10 and PyTorch 2.3.0+cu121 on a CPU-only execution host. CUDA accuracy timing and CUDA allocator-memory measurement were therefore not exercised in that environment.
 
-It can be easily used for multiclass segmentation, portrait segmentation, medical segmentation, ...
-
-
-## Usage
-**Note : Use Python 3.6 or newer**
-
-### Docker
-
-A docker image containing the code and the dependencies is available on [DockerHub](https://hub.docker.com/repository/docker/milesial/unet).
-You can download and jump in the container with ([docker >=19.03](https://docs.docker.com/get-docker/)):
-
-```console
-docker run -it --rm --shm-size=8g --ulimit memlock=-1 --gpus all milesial/unet
-```
-
-
-### Training
-
-```console
-> python train.py -h
-usage: train.py [-h] [--epochs E] [--batch-size B] [--learning-rate LR]
-                [--load LOAD] [--scale SCALE] [--validation VAL] [--amp]
-
-Train the UNet on images and target masks
-
-optional arguments:
-  -h, --help            show this help message and exit
-  --epochs E, -e E      Number of epochs
-  --batch-size B, -b B  Batch size
-  --learning-rate LR, -l LR
-                        Learning rate
-  --load LOAD, -f LOAD  Load model from a .pth file
-  --scale SCALE, -s SCALE
-                        Downscaling factor of the images
-  --validation VAL, -v VAL
-                        Percent of the data that is used as validation (0-100)
-  --amp                 Use mixed precision
-```
-
-By default, the `scale` is 0.5, so if you wish to obtain better results (but use more memory), set it to 1.
-
-Automatic mixed precision is also available with the `--amp` flag. [Mixed precision](https://arxiv.org/abs/1710.03740) allows the model to use less memory and to be faster on recent GPUs by using FP16 arithmetic. Enabling AMP is recommended.
-
-
-### Prediction
-
-After training your model and saving it to `MODEL.pth`, you can easily test the output masks on your images via the CLI.
-
-To predict a single image and save it:
-
-`python predict.py -i image.jpg -o output.jpg`
-
-To predict a multiple images and show them without saving them:
-
-`python predict.py -i image1.jpg image2.jpg --viz --no-save`
-
-```console
-> python predict.py -h
-usage: predict.py [-h] [--model FILE] --input INPUT [INPUT ...] 
-                  [--output INPUT [INPUT ...]] [--viz] [--no-save]
-                  [--mask-threshold MASK_THRESHOLD] [--scale SCALE]
-
-Predict masks from input images
-
-optional arguments:
-  -h, --help            show this help message and exit
-  --model FILE, -m FILE
-                        Specify the file in which the model is stored
-  --input INPUT [INPUT ...], -i INPUT [INPUT ...]
-                        Filenames of input images
-  --output INPUT [INPUT ...], -o INPUT [INPUT ...]
-                        Filenames of output images
-  --viz, -v             Visualize the images as they are processed
-  --no-save, -n         Do not save the output masks
-  --mask-threshold MASK_THRESHOLD, -t MASK_THRESHOLD
-                        Minimum probability value to consider a mask pixel white
-  --scale SCALE, -s SCALE
-                        Scale factor for the input images
-```
-You can specify which model file to use with `--model MODEL.pth`.
-
-## Weights & Biases
-
-The training progress can be visualized in real-time using [Weights & Biases](https://wandb.ai/).  Loss curves, validation curves, weights and gradient histograms, as well as predicted masks are logged to the platform.
-
-When launching a training, a link will be printed in the console. Click on it to go to your dashboard. If you have an existing W&B account, you can link it
- by setting the `WANDB_API_KEY` environment variable. If not, it will create an anonymous run which is automatically deleted after 7 days.
-
-
-## Pretrained model
-A [pretrained model](https://github.com/milesial/Pytorch-UNet/releases/tag/v3.0) is available for the Carvana dataset. It can also be loaded from torch.hub:
-
-```python
-net = torch.hub.load('milesial/Pytorch-UNet', 'unet_carvana', pretrained=True, scale=0.5)
-```
-Available scales are 0.5 and 1.0.
-
-## Data
-The Carvana data is available on the [Kaggle website](https://www.kaggle.com/c/carvana-image-masking-challenge/data).
-
-You can also download it using the helper script:
-
-```
-bash scripts/download_data.sh
-```
-
-The input images and target masks should be in the `data/imgs` and `data/masks` folders respectively (note that the `imgs` and `masks` folder should not contain any sub-folder or any other files, due to the greedy data-loader). For Carvana, images are RGB and masks are black and white.
-
-You can use your own dataset as long as you make sure it is loaded properly in `utils/data_loading.py`.
-
-
----
-
-Original paper by Olaf Ronneberger, Philipp Fischer, Thomas Brox:
-
-[U-Net: Convolutional Networks for Biomedical Image Segmentation](https://arxiv.org/abs/1505.04597)
-
-![network architecture](https://i.imgur.com/jeDVpqF.png)
+No training, accuracy, throughput, latency, FLOP, memory, or model-size numbers are embedded in this README; generate them from an actual checkpoint and real test split.
