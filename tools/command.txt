@@ -1,0 +1,38 @@
+# Tiny-subset overfitting diagnostics
+# Run these commands from the repository root.
+
+# Synapse: train and independently retest the same 12 slices
+python tools/training_tiny.py \
+  --dataset Synapse \
+  --num-samples 12 \
+  --epochs 300 \
+  --output-dir outputs/tiny/synapse
+
+python tools/testing_tiny.py \
+  --dataset Synapse \
+  --checkpoint outputs/tiny/synapse/best_model.pth \
+  --subset-json outputs/tiny/synapse/tiny_subset.json
+
+# ACDC: train and independently retest the same 12 slices
+CUDA_VISIBLE_DEVICES=1 python tools/training_tiny.py \
+  --dataset ACDC \
+  --num-samples 12 \
+  --epochs 150 \
+  --output-dir outputs/tiny/acdc
+
+CUDA_VISIBLE_DEVICES=1 python tools/testing_tiny.py \
+  --dataset ACDC \
+  --checkpoint outputs/tiny/acdc/best_model.pth \
+  --subset-json outputs/tiny/acdc/tiny_subset.json
+
+# Cataract1k: train and independently retest the same 12 RGB frames
+python tools/training_tiny.py \
+  --dataset Cataract1k \
+  --num-samples 12 \
+  --epochs 300 \
+  --output-dir outputs/tiny/cataract1k
+
+python tools/testing_tiny.py \
+  --dataset Cataract1k \
+  --checkpoint outputs/tiny/cataract1k/best_model.pth \
+  --subset-json outputs/tiny/cataract1k/tiny_subset.json

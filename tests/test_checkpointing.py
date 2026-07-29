@@ -46,6 +46,7 @@ class CheckpointingTests(unittest.TestCase):
                 optimizer=optimizer,
                 scheduler=scheduler,
                 epoch=7,
+                global_step=56,
                 best_mean_dice=0.75,
                 dataset="Synapse",
                 img_size=224,
@@ -76,6 +77,8 @@ class CheckpointingTests(unittest.TestCase):
             self.assertTrue(result.structured)
             self.assertEqual(result.epoch, 7)
             self.assertEqual(result.next_epoch, 8)
+            self.assertEqual(result.global_step, 56)
+            self.assertEqual(result.iter_num, 56)
             self.assertAlmostEqual(result.best_mean_dice, 0.75)
             self.assertTrue(result.optimizer_restored)
             self.assertTrue(result.scheduler_restored)
@@ -101,6 +104,27 @@ class CheckpointingTests(unittest.TestCase):
             self.assertFalse(result.structured)
             self.assertEqual(result.mask_values, [0, 1])
             self.assertFalse(result.partial)
+
+    def test_transunet_iter_num_alias_restores_as_global_step(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "iter-num.pth"
+            source = self._model()
+            torch.save(
+                {
+                    "model_state_dict": source.state_dict(),
+                    "dataset": "Synapse",
+                    "iter_num": 19,
+                },
+                path,
+            )
+            result = load_checkpoint(
+                self._model(),
+                path,
+                mode="resume",
+                dataset="Synapse",
+            )
+            self.assertEqual(result.global_step, 19)
+            self.assertEqual(result.iter_num, 19)
 
     def test_metadata_mismatch_fails_before_test_load(self):
         with tempfile.TemporaryDirectory() as directory:

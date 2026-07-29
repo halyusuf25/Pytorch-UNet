@@ -37,6 +37,7 @@ class CheckpointLoadResult:
     metadata: Dict[str, Any] = field(default_factory=dict)
     epoch: Optional[int] = None
     best_mean_dice: Optional[float] = None
+    global_step: Optional[int] = None
     mask_values: Any = None
     loaded_keys: Tuple[str, ...] = ()
     missing_keys: Tuple[str, ...] = ()
@@ -73,6 +74,12 @@ class CheckpointLoadResult:
 
         return 0 if self.epoch is None else int(self.epoch) + 1
 
+    @property
+    def iter_num(self) -> Optional[int]:
+        """TransUNet-compatible alias for the restored optimization step."""
+
+        return self.global_step
+
     def summary(self) -> str:
         details = [
             "checkpoint={}".format(self.path),
@@ -87,6 +94,8 @@ class CheckpointLoadResult:
             details.append("shape_mismatches={}".format(self.shape_mismatches))
         if self.metadata_mismatches:
             details.append("metadata_mismatches={}".format(list(self.metadata_mismatches)))
+        if self.global_step is not None:
+            details.append("global_step={}".format(self.global_step))
         return "; ".join(details)
 
 
@@ -500,6 +509,26 @@ def load_checkpoint(
     epoch = checkpoint.get("epoch") if structured else None
     if epoch is not None:
         epoch = int(epoch)
+    global_step = checkpoint.get("global_step") if structured else None
+    iter_num = checkpoint.get("iter_num") if structured else None
+    if global_step is not None and iter_num is not None:
+        if int(global_step) != int(iter_num):
+            raise ValueError(
+                "Checkpoint global_step={} disagrees with iter_num={}".format(
+                    global_step,
+                    iter_num,
+                )
+            )
+    if global_step is None:
+        global_step = iter_num
+    if global_step is not None:
+        global_step = int(global_step)
+        if global_step < 0:
+            raise ValueError(
+                "Checkpoint global_step/iter_num must be non-negative, got {}".format(
+                    global_step
+                )
+            )
     best_mean_dice = checkpoint.get("best_mean_dice") if structured else None
     if best_mean_dice is not None:
         best_mean_dice = float(best_mean_dice)
@@ -510,6 +539,7 @@ def load_checkpoint(
         structured=structured,
         metadata=metadata,
         epoch=epoch,
+        global_step=global_step,
         best_mean_dice=best_mean_dice,
         mask_values=mask_values,
         loaded_keys=loaded_keys,
@@ -544,6 +574,7 @@ def build_checkpoint(
     scheduler=None,
     scaler=None,
     epoch: Optional[int] = None,
+    global_step: Optional[int] = None,
     best_mean_dice: Optional[float] = None,
     dataset: Optional[str] = None,
     n_channels: Optional[int] = None,
@@ -565,6 +596,10 @@ def build_checkpoint(
         n_classes = getattr(target_model, "n_classes", None)
     if bilinear is None:
         bilinear = getattr(target_model, "bilinear", None)
+    if global_step is not None and int(global_step) < 0:
+        raise ValueError(
+            "global_step must be non-negative, got {}".format(global_step)
+        )
 
     checkpoint = {
         "model_state_dict": target_model.state_dict(),
@@ -584,6 +619,9 @@ def build_checkpoint(
         "normalization": normalization,
         "arguments": _arguments_dict(arguments),
     }
+    if global_step is not None:
+        checkpoint["global_step"] = int(global_step)
+        checkpoint["iter_num"] = int(global_step)
     if mask_values is not None:
         checkpoint["mask_values"] = mask_values
     if extra is not None:

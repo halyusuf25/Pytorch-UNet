@@ -73,12 +73,28 @@ Training and validation resize to the fixed `--img-size` (default 224). Cataract
 Medical training uses the datasets' explicit splits—never `random_split`. The unchanged U-Net is constructed from the registry with 1 input channel for Synapse/ACDC and true 3-channel RGB for Cataract1k. The objective remains:
 
 ```text
-ce_weight * cross_entropy + dice_weight * dice_loss
+loss = (1 - lambda_) * classwise_dice_loss + lambda_ * cross_entropy
 ```
 
-Both weights default to `1.0`. RMSprop, `ReduceLROnPlateau(mode="max")`, AMP, gradient clipping, and the original transposed-convolution default are retained. Python, NumPy, PyTorch, CUDA, and DataLoader workers are seeded; deterministic behavior defaults on and can be disabled with `--no-deterministic`.
+`--lambda_` defaults to `0.5`. Cross-entropy is the standard unweighted
+`CrossEntropyLoss`. The medical Dice loss exactly follows the TransUNet
+`multiconfig` implementation: it one-hot encodes every class, applies softmax,
+computes soft Dice independently for each class with `smooth=1e-5`, includes
+background, and averages equally over all classes. The legacy Carvana loss path
+is unchanged.
 
-Training starts from random initialization because no U-Net pretrained checkpoint was supplied. To initialize from user-provided compatible weights, use `--init-checkpoint PATH` (also `--pretrained-checkpoint`). Use `--resume PATH` only for strict continuation; it requires and restores the epoch, optimizer, scheduler, AMP scaler, Python/NumPy/PyTorch/CUDA RNG, and DataLoader-generator states. A weights-only or incomplete checkpoint must be supplied through `--init-checkpoint` instead. The two modes cannot be combined. Explicitly supplied missing paths fail immediately.
+Medical training uses SGD with a default `--base_lr 0.01`, momentum `0.9`, and
+weight decay `1e-4`. After every optimization step, all parameter groups receive
+the TransUNet polynomial learning rate
+`base_lr * (1 - iter_num / max_iterations)^0.9`, where
+`max_iterations = epochs * len(train_loader)`; the zero-based `iter_num` is then
+incremented. Medical training does not construct or require a
+`ReduceLROnPlateau` scheduler. AMP, gradient clipping, and the original
+transposed-convolution default remain available. Python, NumPy, PyTorch, CUDA,
+and DataLoader workers are seeded; deterministic behavior defaults on and can
+be disabled with `--no-deterministic`.
+
+Training starts from random initialization because no U-Net pretrained checkpoint was supplied. To initialize from user-provided compatible weights, use `--init-checkpoint PATH` (also `--pretrained-checkpoint`). Use `--resume PATH` only for strict continuation; it restores the epoch, optimizer, AMP scaler, Python/NumPy/PyTorch/CUDA RNG, DataLoader-generator state, and medical `global_step` so polynomial decay continues at the correct iteration. Medical resumes do not require scheduler state. A weights-only or incomplete checkpoint must be supplied through `--init-checkpoint` instead. The two modes cannot be combined. Explicitly supplied missing paths fail immediately.
 
 Each output directory contains:
 
@@ -98,7 +114,7 @@ python train.py \
   --img-size 224 \
   --epochs 150 \
   --batch-size 24 \
-  --learning-rate 1e-5 \
+  --base_lr 0.01 \
   --checkpoint-dir outputs/unet/synapse \
   --amp
 
@@ -117,7 +133,7 @@ python train.py \
   --img-size 224 \
   --epochs 150 \
   --batch-size 24 \
-  --learning-rate 1e-5 \
+  --base_lr 0.01 \
   --checkpoint-dir outputs/unet/acdc \
   --amp
 
@@ -137,7 +153,7 @@ python train.py \
   --img-size 224 \
   --epochs 150 \
   --batch-size 24 \
-  --learning-rate 1e-5 \
+  --base_lr 0.01 \
   --checkpoint-dir outputs/unet/cataract1k \
   --amp
 
@@ -150,6 +166,63 @@ python test.py \
 ```
 
 Override defaults with `--root-path`, `--volume-path`, and `--list-dir`. No fictional pretrained path is used in these commands.
+
+## Tiny-subset overfitting diagnostic
+
+`tools/training_tiny.py` is a slice/frame-level sanity check, separate from the
+official validation and test protocols. It deterministically chooses 8--16
+foreground-containing training samples (12 by default), maximizes foreground
+class coverage, disables augmentation, and uses the same resized samples for
+training and validation. The objective is equal parts cross-entropy and
+background-excluded classwise soft Dice. It writes `best_model.pth`,
+`last_model.pth`, and the exact selection in `tiny_subset.json`.
+
+`tools/testing_tiny.py` strictly reloads the best checkpoint and reconstructs
+that exact training subset from the JSON. All reported mean Dice values exclude
+background. Pass `--save-predictions [DIR]` to save image, ground-truth, and
+prediction PNGs.
+
+```bash
+# Synapse
+python tools/training_tiny.py \
+  --dataset Synapse \
+  --num-samples 12 \
+  --epochs 300 \
+  --output-dir outputs/tiny/synapse
+
+python tools/testing_tiny.py \
+  --dataset Synapse \
+  --checkpoint outputs/tiny/synapse/best_model.pth \
+  --subset-json outputs/tiny/synapse/tiny_subset.json
+
+# ACDC
+python tools/training_tiny.py \
+  --dataset ACDC \
+  --num-samples 12 \
+  --epochs 300 \
+  --output-dir outputs/tiny/acdc
+
+python tools/testing_tiny.py \
+  --dataset ACDC \
+  --checkpoint outputs/tiny/acdc/best_model.pth \
+  --subset-json outputs/tiny/acdc/tiny_subset.json
+
+# Cataract1k
+python tools/training_tiny.py \
+  --dataset Cataract1k \
+  --num-samples 12 \
+  --epochs 300 \
+  --output-dir outputs/tiny/cataract1k
+
+python tools/testing_tiny.py \
+  --dataset Cataract1k \
+  --checkpoint outputs/tiny/cataract1k/best_model.pth \
+  --subset-json outputs/tiny/cataract1k/tiny_subset.json
+```
+
+The same commands are collected in `tools/command.txt`. Dataset roots and the
+Synapse list directory come from the central registry; use `--root-path` and
+`--list-dir` when overriding them.
 
 ## Accuracy protocols
 

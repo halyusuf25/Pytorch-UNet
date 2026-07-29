@@ -1,0 +1,246 @@
+{
+  "case_names": [
+    "patient023_frame09_slice_2",
+    "patient064_frame12_slice_0",
+    "patient067_frame10_slice_1",
+    "patient085_frame09_slice_10",
+    "patient060_frame14_slice_4",
+    "patient030_frame01_slice_2",
+    "patient047_frame09_slice_3",
+    "patient064_frame12_slice_7",
+    "patient060_frame01_slice_1",
+    "patient087_frame01_slice_4",
+    "patient082_frame07_slice_15",
+    "patient100_frame01_slice_1"
+  ],
+  "class_names": [
+    "Background",
+    "Right Ventricle",
+    "Myocardium",
+    "Left Ventricle"
+  ],
+  "dataset": "ACDC",
+  "foreground_class_names": [
+    "Right Ventricle",
+    "Myocardium",
+    "Left Ventricle"
+  ],
+  "foreground_classes": [
+    1,
+    2,
+    3
+  ],
+  "format_version": 1,
+  "img_size": 224,
+  "normalization": null,
+  "num_samples": 12,
+  "paths": {
+    "dataset": "ACDC",
+    "list_dir": null,
+    "test_root": "/data/halyusuf/data/ACDC",
+    "train_root": "/data/halyusuf/data/ACDC",
+    "validation_root": "/data/halyusuf/data/ACDC",
+    "volume_root": "/data/halyusuf/data/ACDC"
+  },
+  "samples": [
+    {
+      "case_name": "patient023_frame09_slice_2",
+      "foreground_class_names": [
+        "Right Ventricle",
+        "Myocardium",
+        "Left Ventricle"
+      ],
+      "foreground_classes": [
+        1,
+        2,
+        3
+      ],
+      "index": 45
+    },
+    {
+      "case_name": "patient064_frame12_slice_0",
+      "foreground_class_names": [
+        "Myocardium",
+        "Left Ventricle"
+      ],
+      "foreground_classes": [
+        2,
+        3
+      ],
+      "index": 788
+    },
+    {
+      "case_name": "patient067_frame10_slice_1",
+      "foreground_class_names": [
+        "Right Ventricle",
+        "Myocardium",
+        "Left Ventricle"
+      ],
+      "foreground_classes": [
+        1,
+        2,
+        3
+      ],
+      "index": 843
+    },
+    {
+      "case_name": "patient085_frame09_slice_10",
+      "foreground_class_names": [
+        "Right Ventricle",
+        "Myocardium",
+        "Left Ventricle"
+      ],
+      "foreground_classes": [
+        1,
+        2,
+        3
+      ],
+      "index": 1183
+    },
+    {
+      "case_name": "patient060_frame14_slice_4",
+      "foreground_class_names": [
+        "Right Ventricle",
+        "Myocardium",
+        "Left Ventricle"
+      ],
+      "foreground_classes": [
+        1,
+        2,
+        3
+      ],
+      "index": 719
+    },
+    {
+      "case_name": "patient030_frame01_slice_2",
+      "foreground_class_names": [
+        "Right Ventricle",
+        "Myocardium",
+        "Left Ventricle"
+      ],
+      "foreground_classes": [
+        1,
+        2,
+        3
+      ],
+      "index": 170
+    },
+    {
+      "case_name": "patient047_frame09_slice_3",
+      "foreground_class_names": [
+        "Right Ventricle",
+        "Myocardium",
+        "Left Ventricle"
+      ],
+      "foreground_classes": [
+        1,
+        2,
+        3
+      ],
+      "index": 496
+    },
+    {
+      "case_name": "patient064_frame12_slice_7",
+      "foreground_class_names": [
+        "Right Ventricle",
+        "Myocardium",
+        "Left Ventricle"
+      ],
+      "foreground_classes": [
+        1,
+        2,
+        3
+      ],
+      "index": 795
+    },
+    {
+      "case_name": "patient060_frame01_slice_1",
+      "foreground_class_names": [
+        "Right Ventricle",
+        "Myocardium",
+        "Left Ventricle"
+      ],
+      "foreground_classes": [
+        1,
+        2,
+        3
+      ],
+      "index": 707
+    },
+    {
+      "case_name": "patient087_frame01_slice_4",
+      "foreground_class_names": [
+        "Right Ventricle",
+        "Myocardium",
+        "Left Ventricle"
+      ],
+      "foreground_classes": [
+        1,
+        2,
+        3
+      ],
+      "index": 1214
+    },
+    {
+      "case_name": "patient082_frame07_slice_15",
+      "foreground_class_names": [
+        "Right Ventricle",
+        "Myocardium",
+        "Left Ventricle"
+      ],
+      "foreground_classes": [
+        1,
+        2,
+        3
+      ],
+      "index": 1121
+    },
+    {
+      "case_name": "patient100_frame01_slice_1",
+      "foreground_class_names": [
+        "Right Ventricle",
+        "Myocardium",
+        "Left Ventricle"
+      ],
+      "foreground_classes": [
+        1,
+        2,
+        3
+      ],
+      "index": 1497
+    }
+  ],
+  "seed": 1234,
+  "selected_indices": [
+    45,
+    788,
+    843,
+    1183,
+    719,
+    170,
+    496,
+    795,
+    707,
+    1214,
+    1121,
+    1497
+  ],
+  "success_threshold": 0.9,
+  "training_arguments": {
+    "batch_size": 12,
+    "bilinear": false,
+    "dataset": "ACDC",
+    "device": "auto",
+    "epochs": 150,
+    "img_size": 224,
+    "learning_rate": 0.0003,
+    "list_dir": null,
+    "num_samples": 12,
+    "num_workers": 0,
+    "output_dir": "outputs/tiny/acdc",
+    "root_path": null,
+    "seed": 1234,
+    "success_threshold": 0.9,
+    "weight_decay": 0.0001
+  }
+}

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
+from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -26,12 +28,13 @@ from utils.dataset_registry import (
     get_dataset_spec,
     resolve_dataset_paths,
 )
-from utils.dice_score import dice_loss
+from utils.dice_score import dice_loss as legacy_dice_loss
 from utils.medical_inference import (
     evaluate_cataract_loader,
     evaluate_volume_loader,
     foreground_validation_dice,
 )
+from utils.medical_losses import DiceLoss
 from utils.medical_metrics import fallback_acdc_voxelspacing_zyx
 from utils.model_output import _extract_logits, extract_target, validate_labels, validate_model_input
 from utils.runtime import (
@@ -48,6 +51,11 @@ from utils.runtime import (
 DEFAULT_IMAGE_DIR = Path("./data/imgs/")
 DEFAULT_MASK_DIR = Path("./data/masks/")
 MEDICAL_DATASETS = ("Synapse", "ACDC", "Cataract1k", "Catrakt1k")
+DEFAULT_MEDICAL_BASE_LR = 0.01
+DEFAULT_CARVANA_LEARNING_RATE = 1e-5
+MEDICAL_MOMENTUM = 0.9
+MEDICAL_WEIGHT_DECAY = 1e-4
+MEDICAL_POLY_POWER = 0.9
 
 
 class _NoOpExperiment:
@@ -79,7 +87,20 @@ def _make_grad_scaler(enabled: bool):
         return torch.cuda.amp.GradScaler(enabled=enabled)
 
 
-def _make_optimizer(model: torch.nn.Module, args: argparse.Namespace):
+def _make_optimizer(
+    model: torch.nn.Module,
+    args: argparse.Namespace,
+    *,
+    medical: bool = False,
+):
+    if medical:
+        return optim.SGD(
+            model.parameters(),
+            lr=args.learning_rate,
+            momentum=MEDICAL_MOMENTUM,
+            weight_decay=MEDICAL_WEIGHT_DECAY,
+        )
+
     kwargs = dict(
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
@@ -89,6 +110,35 @@ def _make_optimizer(model: torch.nn.Module, args: argparse.Namespace):
         return optim.RMSprop(model.parameters(), foreach=True, **kwargs)
     except TypeError:  # foreach is unavailable on older supported PyTorch builds
         return optim.RMSprop(model.parameters(), **kwargs)
+
+
+def _medical_polynomial_learning_rate(
+    base_lr: float,
+    iter_num: int,
+    max_iterations: int,
+) -> float:
+    """Return the exact TransUNet polynomial learning rate for one step."""
+
+    if max_iterations <= 0:
+        raise ValueError("max_iterations must be positive")
+    if iter_num < 0 or iter_num > max_iterations:
+        raise ValueError(
+            f"iter_num must be in [0, {max_iterations}], got {iter_num}"
+        )
+    return float(base_lr) * (1.0 - iter_num / max_iterations) ** MEDICAL_POLY_POWER
+
+
+def _update_medical_learning_rate(
+    optimizer: torch.optim.Optimizer,
+    *,
+    base_lr: float,
+    iter_num: int,
+    max_iterations: int,
+) -> float:
+    lr = _medical_polynomial_learning_rate(base_lr, iter_num, max_iterations)
+    for parameter_group in optimizer.param_groups:
+        parameter_group["lr"] = lr
+    return lr
 
 
 def _loader_kwargs(
@@ -272,6 +322,7 @@ def _checkpoint_fields(
     scheduler: Any,
     scaler: Any,
     epoch: int,
+    global_step: int,
     best_mean_dice: float,
     spec: Any,
     args: argparse.Namespace,
@@ -285,6 +336,7 @@ def _checkpoint_fields(
         "scheduler": scheduler,
         "scaler": scaler,
         "epoch": epoch,
+        "global_step": global_step,
         "best_mean_dice": best_mean_dice,
         "dataset": spec.name,
         "n_channels": spec.input_channels,
@@ -305,6 +357,13 @@ def _checkpoint_fields(
 
 
 def run_training(args: argparse.Namespace) -> None:
+    medical = args.dataset != "Carvana"
+    if args.learning_rate is None:
+        args.learning_rate = (
+            DEFAULT_MEDICAL_BASE_LR
+            if medical
+            else DEFAULT_CARVANA_LEARNING_RATE
+        )
     if args.resume and (args.init_checkpoint or args.load):
         raise ValueError("--resume cannot be combined with an initialization checkpoint")
     if args.init_checkpoint and args.load:
@@ -317,8 +376,19 @@ def run_training(args: argparse.Namespace) -> None:
         raise ValueError("--batch-size and --epochs must be positive")
     if args.num_workers < 0:
         raise ValueError("--num-workers cannot be negative")
-    if args.ce_weight < 0 or args.dice_weight < 0 or not (args.ce_weight or args.dice_weight):
-        raise ValueError("Loss weights must be non-negative and at least one must be positive")
+    if not math.isfinite(args.learning_rate) or args.learning_rate <= 0:
+        raise ValueError("--base_lr/--learning-rate must be a positive finite value")
+    if medical:
+        if not math.isfinite(args.lambda_) or not 0.0 <= args.lambda_ <= 1.0:
+            raise ValueError("--lambda_ must be a finite value in [0, 1]")
+    elif (
+        args.ce_weight < 0
+        or args.dice_weight < 0
+        or not (args.ce_weight or args.dice_weight)
+    ):
+        raise ValueError(
+            "Carvana loss weights must be non-negative and at least one must be positive"
+        )
     if args.dataset == "Carvana" and not 0 < args.validation < 100:
         raise ValueError("Carvana --validation must be between 0 and 100 percent")
     for option, checkpoint_value in (
@@ -332,7 +402,6 @@ def run_training(args: argparse.Namespace) -> None:
 
     device = resolve_device(args.device)
     seed_everything(args.seed, args.deterministic)
-    medical = args.dataset != "Carvana"
     if medical:
         args.dataset = canonicalize_dataset_name(args.dataset)
         if args.dataset == "ACDC":
@@ -389,18 +458,39 @@ def run_training(args: argparse.Namespace) -> None:
         )
         logging.info("Initialization loaded: %s", init_result.summary())
 
-    optimizer = _make_optimizer(model, args)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", patience=args.scheduler_patience
+    optimizer = _make_optimizer(model, args, medical=medical)
+    scheduler = (
+        None
+        if medical
+        else optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="max",
+            patience=args.scheduler_patience,
+        )
     )
     amp_enabled = bool(args.amp and device.type == "cuda")
     if args.amp and not amp_enabled:
         logging.warning("AMP requested on %s; CUDA AMP is disabled", device.type)
     scaler = _make_grad_scaler(amp_enabled)
-    criterion = nn.CrossEntropyLoss() if spec.num_classes > 1 else nn.BCEWithLogitsLoss()
+    if medical:
+        lambda_ = args.lambda_
+        ce_loss = nn.CrossEntropyLoss()
+        dice_loss = DiceLoss(spec.num_classes)
+        criterion = None
+    else:
+        lambda_ = None
+        criterion = (
+            nn.CrossEntropyLoss()
+            if spec.num_classes > 1
+            else nn.BCEWithLogitsLoss()
+        )
+        ce_loss = None
+        dice_loss = None
 
     first_epoch = 1
+    global_step = 0
     best_mean_dice = float("-inf")
+    max_iterations = args.epochs * len(train_loader)
     if args.resume:
         resume_result = load_checkpoint(
             model,
@@ -416,6 +506,8 @@ def run_training(args: argparse.Namespace) -> None:
             bilinear=args.bilinear,
         )
         first_epoch = max(1, resume_result.next_epoch)
+        if resume_result.global_step is not None:
+            global_step = resume_result.global_step
         if resume_result.best_mean_dice is not None:
             best_mean_dice = resume_result.best_mean_dice
         missing_continuation = []
@@ -427,12 +519,14 @@ def run_training(args: argparse.Namespace) -> None:
             missing_continuation.append("best validation Dice")
         if not resume_result.optimizer_restored:
             missing_continuation.append("optimizer state")
-        if not resume_result.scheduler_restored:
+        if scheduler is not None and not resume_result.scheduler_restored:
             missing_continuation.append("scheduler state")
         if not resume_result.scaler_restored:
             missing_continuation.append("gradient-scaler state")
         if resume_result.rng_state is None:
             missing_continuation.append("RNG/DataLoader state")
+        if medical and resume_result.global_step is None:
+            missing_continuation.append("global_step/iter_num")
         checkpoint_img_size = resume_result.metadata.get("img_size")
         if checkpoint_img_size is None:
             missing_continuation.append("image-size metadata")
@@ -451,12 +545,71 @@ def run_training(args: argparse.Namespace) -> None:
                     checkpoint_normalization, expected_normalization
                 )
             )
+        if medical:
+            checkpoint_arguments = resume_result.metadata.get("arguments")
+            if not isinstance(checkpoint_arguments, Mapping):
+                missing_continuation.append("training arguments")
+            else:
+                required_resume_arguments = {
+                    "epochs": args.epochs,
+                    "batch_size": args.batch_size,
+                    "learning_rate": args.learning_rate,
+                    "lambda_": args.lambda_,
+                }
+                missing_arguments = [
+                    name
+                    for name in required_resume_arguments
+                    if checkpoint_arguments.get(name) is None
+                ]
+                if missing_arguments:
+                    missing_continuation.append(
+                        "training arguments ({})".format(
+                            ", ".join(missing_arguments)
+                        )
+                    )
+                for name, expected_value in required_resume_arguments.items():
+                    if name in missing_arguments:
+                        continue
+                    saved_value = checkpoint_arguments[name]
+                    if isinstance(expected_value, float):
+                        matches = math.isclose(
+                            float(saved_value),
+                            expected_value,
+                            rel_tol=0.0,
+                            abs_tol=1e-12,
+                        )
+                    else:
+                        matches = int(saved_value) == int(expected_value)
+                    if not matches:
+                        raise ValueError(
+                            "Medical resume argument {}={} disagrees with "
+                            "checkpoint value {}. Exact polynomial continuation "
+                            "requires unchanged epochs, batch size, base LR, and "
+                            "lambda_.".format(
+                                name,
+                                expected_value,
+                                saved_value,
+                            )
+                        )
         if missing_continuation:
             raise ValueError(
                 "--resume requires an exact structured continuation checkpoint; missing "
                 + ", ".join(missing_continuation)
                 + ". Use --init-checkpoint to load weights without continuation state."
             )
+        if medical:
+            expected_global_step = int(resume_result.epoch) * len(train_loader)
+            if global_step != expected_global_step:
+                raise ValueError(
+                    "Medical resume global_step={} disagrees with epoch {} and "
+                    "{} iterations per epoch (expected {}). Check that the dataset "
+                    "and batch size match the original run.".format(
+                        global_step,
+                        resume_result.epoch,
+                        len(train_loader),
+                        expected_global_step,
+                    )
+                )
         restore_rng_state(
             resume_result.rng_state,
             train_generator=train_loader.generator,
@@ -467,29 +620,54 @@ def run_training(args: argparse.Namespace) -> None:
         raise ValueError(
             f"Resume checkpoint starts at epoch {first_epoch}, beyond requested --epochs {args.epochs}"
         )
+    if global_step > max_iterations:
+        raise ValueError(
+            f"Resume global_step={global_step} exceeds max_iterations={max_iterations}"
+        )
 
     checkpoint_dir = Path(args.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    logging.info(
-        "Optimizer=RMSprop lr=%g weight_decay=%g momentum=%g AMP=%s CE_weight=%g "
-        "Dice_weight=%g gradient_clip=%g checkpoints=%s init=%s resume=%s",
-        args.learning_rate,
-        args.weight_decay,
-        args.momentum,
-        amp_enabled,
-        args.ce_weight,
-        args.dice_weight,
-        args.gradient_clipping,
-        checkpoint_dir,
-        init_path,
-        args.resume,
-    )
+    if medical:
+        logging.info(
+            "Optimizer=SGD base_lr=%g momentum=%g weight_decay=%g "
+            "schedule=poly(power=%g, max_iterations=%d) lambda_=%g AMP=%s "
+            "gradient_clip=%g checkpoints=%s init=%s resume=%s global_step=%d",
+            args.learning_rate,
+            MEDICAL_MOMENTUM,
+            MEDICAL_WEIGHT_DECAY,
+            MEDICAL_POLY_POWER,
+            max_iterations,
+            args.lambda_,
+            amp_enabled,
+            args.gradient_clipping,
+            checkpoint_dir,
+            init_path,
+            args.resume,
+            global_step,
+        )
+    else:
+        logging.info(
+            "Optimizer=RMSprop lr=%g weight_decay=%g momentum=%g AMP=%s "
+            "CE_weight=%g Dice_weight=%g gradient_clip=%g checkpoints=%s "
+            "init=%s resume=%s",
+            args.learning_rate,
+            args.weight_decay,
+            args.momentum,
+            amp_enabled,
+            args.ce_weight,
+            args.dice_weight,
+            args.gradient_clipping,
+            checkpoint_dir,
+            init_path,
+            args.resume,
+        )
     experiment = _start_wandb(args)
-    global_step = 0
 
     for epoch in range(first_epoch, args.epochs + 1):
         model.train()
         epoch_loss = 0.0
+        epoch_ce_loss = 0.0
+        epoch_dice_loss = 0.0
         progress = tqdm(
             total=len(train_set),
             desc=f"Epoch {epoch}/{args.epochs}",
@@ -506,34 +684,72 @@ def run_training(args: argparse.Namespace) -> None:
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast("cuda", enabled=amp_enabled):
                 logits = _extract_logits(model(images))
-                if spec.num_classes == 1:
+                if medical:
+                    loss_ce = ce_loss(logits, targets.long())
+                    loss_dice = dice_loss(
+                        logits,
+                        targets,
+                        softmax=True,
+                    )
+                    loss = (
+                        (1.0 - lambda_) * loss_dice
+                        + lambda_ * loss_ce
+                    )
+                    ce_component = loss_ce
+                    dice_component = loss_dice
+                elif spec.num_classes == 1:
                     ce_component = criterion(logits.squeeze(1), targets.float())
-                    dice_component = dice_loss(
+                    dice_component = legacy_dice_loss(
                         torch.sigmoid(logits.squeeze(1)), targets.float(), multiclass=False
                     )
                 else:
                     ce_component = criterion(logits, targets)
                     one_hot = F.one_hot(targets, spec.num_classes).permute(0, 3, 1, 2).float()
-                    dice_component = dice_loss(
+                    dice_component = legacy_dice_loss(
                         F.softmax(logits, dim=1).float(), one_hot, multiclass=True
                     )
-                loss = args.ce_weight * ce_component + args.dice_weight * dice_component
+                    loss = (
+                        args.ce_weight * ce_component
+                        + args.dice_weight * dice_component
+                    )
+                if not medical and spec.num_classes == 1:
+                    loss = (
+                        args.ce_weight * ce_component
+                        + args.dice_weight * dice_component
+                    )
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_clipping)
             scaler.step(optimizer)
             scaler.update()
 
+            if medical:
+                current_learning_rate = _update_medical_learning_rate(
+                    optimizer,
+                    base_lr=args.learning_rate,
+                    iter_num=global_step,
+                    max_iterations=max_iterations,
+                )
+            else:
+                current_learning_rate = optimizer.param_groups[0]["lr"]
             batch_count = int(images.shape[0])
             global_step += 1
             epoch_loss += float(loss.item())
+            epoch_ce_loss += float(ce_component.item())
+            epoch_dice_loss += float(dice_component.item())
             progress.update(batch_count)
-            progress.set_postfix(loss=float(loss.item()))
+            progress.set_postfix(
+                loss=float(loss.item()),
+                loss_ce=float(ce_component.item()),
+                loss_dice=float(dice_component.item()),
+                lr=current_learning_rate,
+            )
             experiment.log(
                 {
                     "train/loss": float(loss.item()),
                     "train/cross_entropy": float(ce_component.item()),
                     "train/dice_loss": float(dice_component.item()),
+                    "learning_rate": current_learning_rate,
                     "epoch": epoch,
                     "step": global_step,
                 }
@@ -551,7 +767,8 @@ def run_training(args: argparse.Namespace) -> None:
                 score = evaluate(model, validation_loader, device, amp_enabled)
                 validation_score = float(score.item() if torch.is_tensor(score) else score)
                 validation_result = {"mean_dice": validation_score, "protocol": "legacy_2d_dice"}
-            scheduler.step(validation_score)
+            if scheduler is not None:
+                scheduler.step(validation_score)
             logging.info(
                 "Epoch %d validation foreground mean Dice %.6f (%s)",
                 epoch,
@@ -579,6 +796,7 @@ def run_training(args: argparse.Namespace) -> None:
                         scheduler=scheduler,
                         scaler=scaler,
                         epoch=epoch,
+                        global_step=global_step,
                         best_mean_dice=best_mean_dice,
                         spec=spec,
                         args=args,
@@ -595,6 +813,7 @@ def run_training(args: argparse.Namespace) -> None:
             scheduler=scheduler,
             scaler=scaler,
             epoch=epoch,
+            global_step=global_step,
             best_mean_dice=best_mean_dice,
             spec=spec,
             args=args,
@@ -606,10 +825,14 @@ def run_training(args: argparse.Namespace) -> None:
         if args.save_every and epoch % args.save_every == 0:
             periodic = save_checkpoint(checkpoint_dir / f"checkpoint_epoch_{epoch}.pth", **fields)
             logging.info("Periodic checkpoint saved: %s", periodic)
+        epoch_batches = max(1, len(train_loader))
         logging.info(
-            "Epoch %d mean training loss %.6f; last checkpoint=%s",
+            "Epoch %d mean training losses: total=%.6f CE=%.6f Dice=%.6f; "
+            "last checkpoint=%s",
             epoch,
-            epoch_loss / max(1, len(train_loader)),
+            epoch_loss / epoch_batches,
+            epoch_ce_loss / epoch_batches,
+            epoch_dice_loss / epoch_batches,
             last_path,
         )
 
@@ -631,7 +854,16 @@ def get_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--epochs", "--max_epochs", "-e", type=int, default=5)
     parser.add_argument("--batch-size", "--batch_size", "-b", type=int, default=1)
     parser.add_argument(
-        "--learning-rate", "--base_lr", "-l", dest="learning_rate", type=float, default=1e-5
+        "--learning-rate",
+        "--base_lr",
+        "-l",
+        dest="learning_rate",
+        type=float,
+        default=None,
+        help=(
+            "Base learning rate (default: 0.01 for medical SGD; "
+            "1e-5 for legacy Carvana RMSprop)"
+        ),
     )
     parser.add_argument(
         "--checkpoint-dir", "--output_dir", dest="checkpoint_dir", default="checkpoints"
@@ -659,6 +891,12 @@ def get_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--ce-weight", type=float, default=1.0)
     parser.add_argument("--dice-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--lambda_",
+        type=float,
+        default=0.5,
+        help="Medical CE weight in (1-lambda_)*Dice + lambda_*CE",
+    )
     parser.add_argument("--gradient-clipping", type=float, default=1.0)
     parser.add_argument("--save-every", type=int, default=0)
     parser.add_argument("--weight-decay", type=float, default=1e-8)
@@ -679,7 +917,14 @@ def get_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--scale", "-s", type=float, default=0.5)
     parser.add_argument("--validation", "-v", type=float, default=10.0)
     parser.add_argument("--classes", "-c", type=int)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.learning_rate is None:
+        args.learning_rate = (
+            DEFAULT_CARVANA_LEARNING_RATE
+            if args.dataset == "Carvana"
+            else DEFAULT_MEDICAL_BASE_LR
+        )
+    return args
 
 
 def main(argv: list[str] | None = None) -> None:

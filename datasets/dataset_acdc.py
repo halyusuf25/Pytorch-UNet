@@ -233,14 +233,13 @@ def random_rot_flip(image: np.ndarray, label: np.ndarray) -> tuple[np.ndarray, n
 
 def random_rotate(image: np.ndarray, label: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     angle = np.random.randint(-20, 20)
-    # Preserve the supplied ACDC interpolation choices (nearest for both).
-    image = ndimage.rotate(image, angle, order=0, reshape=False)
+    image = ndimage.rotate(image, angle, order=3, reshape=False)
     label = ndimage.rotate(label, angle, order=0, reshape=False)
     return image, label
 
 
 class RandomGenerator4ACDC:
-    """Reference ACDC training augmentation and nearest-neighbor resize."""
+    """ACDC augmentation with cubic images and nearest-neighbor labels."""
 
     def __init__(self, output_size: Sequence[int]):
         if len(output_size) != 2 or any(int(value) <= 0 for value in output_size):
@@ -269,7 +268,7 @@ class RandomGenerator4ACDC:
         height, width = image.shape
         if (height, width) != self.output_size:
             factors = (self.output_size[0] / height, self.output_size[1] / width)
-            image = zoom(image, factors, order=0)
+            image = zoom(image, factors, order=3)
             label = zoom(label, factors, order=0)
 
         if image.shape != self.output_size or label.shape != self.output_size:

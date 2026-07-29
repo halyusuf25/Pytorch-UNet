@@ -1,5 +1,5 @@
 # Synapse
-CUDA_VISIBLE_DEVICES=0 python train.py --dataset Synapse --img-size 224 --epochs 250 \
+CUDA_VISIBLE_DEVICES=4 python train.py --dataset Synapse --img-size 224 --epochs 250 \
   --batch-size 24 --learning-rate 1e-5 \
   --checkpoint-dir outputs/unet/synapse --amp
 
@@ -8,7 +8,7 @@ CUDA_VISIBLE_DEVICES=0 python test.py --dataset Synapse \
   --img-size 224 --benchmark-dir benchmark
 
 # ACDC
-CUDA_VISIBLE_DEVICES=1 python train.py --dataset ACDC --img-size 224 --epochs 250 \
+CUDA_VISIBLE_DEVICES=0 python train.py --dataset ACDC --img-size 224 --epochs 250 \
   --batch-size 24 --learning-rate 1e-5 \
   --checkpoint-dir outputs/unet/acdc --amp
 
